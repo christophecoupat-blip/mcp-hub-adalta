@@ -1,152 +1,92 @@
 'use strict';
 
-// ── server.js — MCP Hub ADALTA v2 ─────────────────────────────────────────────
-// Gère correctement le protocole MCP/SSE avec suivi des sessions.
+// ── setup.js ──────────────────────────────────────────────────────────────────
+// Exécuté automatiquement lors de "npm install" (postinstall).
+// Clone chaque repo MCP depuis GitHub et installe ses dépendances.
+// Ce script tourne côté Scalingo au moment du BUILD, pas au runtime.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const express = require('express');
-const http    = require('http');
-const { spawn } = require('child_process');
-const path    = require('path');
+const { execSync } = require('child_process');
+const fs   = require('fs');
+const path = require('path');
 
-const SERVICES = [
-  { name: 'pennylane', repo: 'pennylane-mcp', port: 3001 },
-  { name: 'urssaf',    repo: 'urssaf-mcp',    port: 3002 },
-  { name: 'rne',       repo: 'rne-mcp',       port: 3003 },
-  { name: 'bocc',      repo: 'bocc-mcp',      port: 3004 },
-  { name: 'judilibre', repo: 'judilibre-mcp', port: 3005 },
-  { name: 'kali',      repo: 'kali-mcp',      port: 3006 },
-  { name: 'boss',      repo: 'boss-mcp',      port: 3007 },
-  { name: 'bofip',     repo: 'bofip-mcp',     port: 3008 },
-  { name: 'sirene',    repo: 'sirene-mcp',    port: 3009 },
-  { name: 'legifrance',repo: 'legifrance-mcp',port: 3010 },
+const GITHUB_ORG  = 'christophecoupat-blip';
+const SERVICES_DIR = path.join(__dirname, 'services');
+
+const REPOS = [
+  'pennylane-mcp',
+  'urssaf-mcp',
+  'rne-mcp',
+  'bocc-mcp',
+  'judilibre-mcp',
+  'kali-mcp',
+  'boss-mcp',
+  'bofip-mcp',
+  'sirene-mcp',
+  'legifrance-mcp',
 ];
 
-const SERVICES_DIR = path.join(__dirname, 'services');
-const sessions = new Map(); // sessionId → port
-
-function startService(svc) {
-  const dir = path.join(SERVICES_DIR, svc.repo);
-  console.log(`[HUB] Démarrage ${svc.name} (port ${svc.port})...`);
-  const child = spawn('npm', ['start'], {
-    cwd: dir,
-    env: { ...process.env, PORT: String(svc.port) },
-    stdio: ['ignore', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
-  });
-  child.stdout.on('data', d => process.stdout.write(`[${svc.name}] ${d}`));
-  child.stderr.on('data', d => process.stderr.write(`[${svc.name}] ${d}`));
-  child.on('exit', (code, signal) => {
-    if (signal === 'SIGTERM') return;
-    console.warn(`[HUB] ${svc.name} arrêté. Redémarrage dans 5s...`);
-    setTimeout(() => startService(svc), 5000);
-  });
+// Créer le dossier services/ si absent
+if (!fs.existsSync(SERVICES_DIR)) {
+  fs.mkdirSync(SERVICES_DIR, { recursive: true });
+  console.log('[SETUP] Dossier services/ créé');
 }
 
-for (const svc of SERVICES) startService(svc);
+let errors = 0;
 
-const STARTUP_DELAY = parseInt(process.env.STARTUP_DELAY || '10000', 10);
-console.log(`[HUB] Attente ${STARTUP_DELAY / 1000}s...`);
+for (const repo of REPOS) {
+  const dir = path.join(SERVICES_DIR, repo);
+  const url = `https://github.com/${GITHUB_ORG}/${repo}.git`;
 
-setTimeout(() => {
-  const app = express();
+  console.log(`\n${'─'.repeat(60)}`);
+  console.log(`[SETUP] Traitement de : ${repo}`);
 
-  app.get('/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      sessions: sessions.size,
-      connecteurs: SERVICES.map(s => ({
-        nom: s.name,
-        sse: `https://mcp-hub-adalta.osc-fr1.scalingo.io/${s.name}/sse`,
-      })),
-    });
-  });
-
-  // SSE avec tracking de session
-  app.get('/:service/sse', (req, res) => {
-    const svc = SERVICES.find(s => s.name === req.params.service);
-    if (!svc) return res.status(404).json({ error: 'Service inconnu' });
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    const targetReq = http.request({
-      hostname: 'localhost', port: svc.port, path: '/sse', method: 'GET',
-      headers: { 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache' },
-    }, (targetRes) => {
-      targetRes.on('data', (chunk) => {
-        const text = chunk.toString();
-        const match = text.match(/data:\s*\/messages\?sessionId=([^\s\n\r]+)/);
-        if (match) {
-          const sessionId = match[1].trim();
-          sessions.set(sessionId, svc.port);
-          console.log(`[HUB] Session: ${sessionId} → ${svc.name}`);
-        }
-        res.write(text);
+  // ── Clone ou mise à jour ──────────────────────────────────────
+  if (!fs.existsSync(dir)) {
+    console.log(`[SETUP] ▶ Clonage depuis GitHub...`);
+    try {
+      execSync(`git clone --depth 1 "${url}" "${dir}"`, {
+        stdio: 'inherit',
+        timeout: 90_000,
       });
-      targetRes.on('end', () => res.end());
-      targetRes.on('error', () => res.end());
-    });
+      console.log(`[SETUP] ✓ Cloné avec succès`);
+    } catch (err) {
+      console.error(`[SETUP] ✗ Échec du clonage : ${err.message}`);
+      errors++;
+      continue;
+    }
+  } else {
+    console.log(`[SETUP] ↻ Déjà présent — mise à jour (git pull)...`);
+    try {
+      execSync('git pull --rebase origin main', {
+        cwd: dir, stdio: 'inherit', timeout: 30_000,
+      });
+    } catch {
+      console.warn(`[SETUP] ⚠ git pull ignoré (branche ou réseau)`);
+    }
+  }
 
-    targetReq.on('error', (err) => {
-      console.error(`[HUB] Erreur ${svc.name}:`, err.message);
-      res.end();
+  // ── Installation des dépendances npm ─────────────────────────
+  console.log(`[SETUP] ▶ npm install --production...`);
+  try {
+    execSync('npm install --production --no-audit --no-fund', {
+      cwd: dir,
+      stdio: 'inherit',
+      timeout: 180_000,
     });
-    targetReq.end();
-    req.on('close', () => targetReq.destroy());
-  });
+    console.log(`[SETUP] ✓ Dépendances installées`);
+  } catch (err) {
+    console.error(`[SETUP] ✗ npm install échoué : ${err.message}`);
+    errors++;
+  }
+}
 
-  // POST /messages → routing par sessionId
-  app.post('/messages', (req, res) => {
-    const sessionId = req.query.sessionId;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId manquant' });
-    const port = sessions.get(sessionId);
-    if (!port) return res.status(404).json({ error: `Session inconnue: ${sessionId}` });
+console.log(`\n${'═'.repeat(60)}`);
 
-    const proxyReq = http.request({
-      hostname: 'localhost', port, method: 'POST',
-      path: `/messages?sessionId=${sessionId}`,
-      headers: { ...req.headers, host: `localhost:${port}` },
-    }, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
-    });
-    proxyReq.on('error', (err) => {
-      if (!res.headersSent) res.status(503).json({ error: err.message });
-    });
-    req.pipe(proxyReq);
-  });
+if (errors > 0) {
+  console.error(`[SETUP] ✗ ${errors} erreur(s) détectée(s). Build interrompu.`);
+  process.exit(1);
+}
 
-  // POST /:service/messages → compatibilité
-  app.post('/:service/messages', (req, res) => {
-    const svc = SERVICES.find(s => s.name === req.params.service);
-    if (!svc) return res.status(404).json({ error: 'Service inconnu' });
-    const sessionId = req.query.sessionId;
-    const proxyReq = http.request({
-      hostname: 'localhost', port: svc.port, method: 'POST',
-      path: `/messages${sessionId ? `?sessionId=${sessionId}` : ''}`,
-      headers: { ...req.headers, host: `localhost:${svc.port}` },
-    }, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
-    });
-    proxyReq.on('error', (err) => {
-      if (!res.headersSent) res.status(503).json({ error: err.message });
-    });
-    req.pipe(proxyReq);
-  });
-
-  const PORT = parseInt(process.env.PORT || '5000', 10);
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log('\n' + '═'.repeat(50));
-    console.log('  MCP HUB ADALTA v2 — ACTIF sur port ' + PORT);
-    console.log('═'.repeat(50));
-    SERVICES.forEach(s => console.log(`  ✓ /${s.name}/sse`));
-    console.log('═'.repeat(50) + '\n');
-  });
-
-}, STARTUP_DELAY);
+console.log('[SETUP] ✅ Tous les services installés avec succès !');
+console.log('[SETUP] Le hub est prêt à démarrer.\n');
