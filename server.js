@@ -1,9 +1,5 @@
 'use strict';
 
-// ── server.js — MCP Hub ADALTA v2 ─────────────────────────────────────────────
-// Gère correctement le protocole MCP/SSE avec suivi des sessions.
-// ─────────────────────────────────────────────────────────────────────────────
-
 const express = require('express');
 const http    = require('http');
 const { spawn } = require('child_process');
@@ -23,7 +19,8 @@ const SERVICES = [
 ];
 
 const SERVICES_DIR = path.join(__dirname, 'services');
-const sessions = new Map(); // sessionId → port
+// sessionId → { port, msgPath: '/message' ou '/messages' }
+const sessions = new Map();
 
 function startService(svc) {
   const dir = path.join(SERVICES_DIR, svc.repo);
@@ -63,7 +60,7 @@ setTimeout(() => {
     });
   });
 
-  // SSE avec tracking de session
+  // SSE — capture /message OU /messages
   app.get('/:service/sse', (req, res) => {
     const svc = SERVICES.find(s => s.name === req.params.service);
     if (!svc) return res.status(404).json({ error: 'Service inconnu' });
@@ -80,12 +77,17 @@ setTimeout(() => {
     }, (targetRes) => {
       targetRes.on('data', (chunk) => {
         const text = chunk.toString();
-        const match = text.match(/data:\s*\/messages\?sessionId=([^\s\n\r]+)/);
+
+        // Capture /message?sessionId= OU /messages?sessionId=
+        const match = text.match(/data:\s*(\/messages?\?sessionId=([^\s\n\r]+))/);
         if (match) {
-          const sessionId = match[1].trim();
-          sessions.set(sessionId, svc.port);
-          console.log(`[HUB] Session: ${sessionId} → ${svc.name}`);
+          const fullEndpoint = match[1].trim();          // ex: /message?sessionId=xxx
+          const sessionId    = match[2].trim();          // ex: 1778413152057
+          const msgPath      = fullEndpoint.split('?')[0]; // /message ou /messages
+          sessions.set(sessionId, { port: svc.port, msgPath });
+          console.log(`[HUB] Session: ${sessionId} → ${svc.name} (${msgPath})`);
         }
+
         res.write(text);
       });
       targetRes.on('end', () => res.end());
@@ -100,16 +102,22 @@ setTimeout(() => {
     req.on('close', () => targetReq.destroy());
   });
 
-  // POST /messages → routing par sessionId
-  app.post('/messages', (req, res) => {
+  // POST /message ou /messages → routing par sessionId
+  function handlePost(req, res) {
     const sessionId = req.query.sessionId;
     if (!sessionId) return res.status(400).json({ error: 'sessionId manquant' });
-    const port = sessions.get(sessionId);
-    if (!port) return res.status(404).json({ error: `Session inconnue: ${sessionId}` });
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      console.warn(`[HUB] Session inconnue: ${sessionId}`);
+      return res.status(404).json({ error: `Session inconnue: ${sessionId}` });
+    }
+
+    const { port, msgPath } = session;
 
     const proxyReq = http.request({
       hostname: 'localhost', port, method: 'POST',
-      path: `/messages?sessionId=${sessionId}`,
+      path: `${msgPath}?sessionId=${sessionId}`,
       headers: { ...req.headers, host: `localhost:${port}` },
     }, (proxyRes) => {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -119,34 +127,25 @@ setTimeout(() => {
       if (!res.headersSent) res.status(503).json({ error: err.message });
     });
     req.pipe(proxyReq);
-  });
+  }
 
-  // POST /:service/messages → compatibilité
-  app.post('/:service/messages', (req, res) => {
+  app.post('/messages', handlePost);
+  app.post('/message',  handlePost);
+
+  // Compatibilité /:service/messages et /:service/message
+  app.post('/:service/messages', (req, res) => proxyToService(req, res, '/messages'));
+  app.post('/:service/message',  (req, res) => proxyToService(req, res, '/message'));
+
+  function proxyToService(req, res, msgPath) {
     const svc = SERVICES.find(s => s.name === req.params.service);
     if (!svc) return res.status(404).json({ error: 'Service inconnu' });
     const sessionId = req.query.sessionId;
     const proxyReq = http.request({
       hostname: 'localhost', port: svc.port, method: 'POST',
-      path: `/messages${sessionId ? `?sessionId=${sessionId}` : ''}`,
+      path: `${msgPath}${sessionId ? `?sessionId=${sessionId}` : ''}`,
       headers: { ...req.headers, host: `localhost:${svc.port}` },
     }, (proxyRes) => {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res);
     });
-    proxyReq.on('error', (err) => {
-      if (!res.headersSent) res.status(503).json({ error: err.message });
-    });
-    req.pipe(proxyReq);
-  });
-
-  const PORT = parseInt(process.env.PORT || '5000', 10);
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log('\n' + '═'.repeat(50));
-    console.log('  MCP HUB ADALTA v2 — ACTIF sur port ' + PORT);
-    console.log('═'.repeat(50));
-    SERVICES.forEach(s => console.log(`  ✓ /${s.name}/sse`));
-    console.log('═'.repeat(50) + '\n');
-  });
-
-}, STARTUP_DELAY);
+ 
