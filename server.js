@@ -1,19 +1,14 @@
 'use strict';
 
-// ── server.js — MCP Hub ADALTA ────────────────────────────────────────────────
-// Démarre les 10 serveurs MCP en tant que processus enfants,
-// puis proxy les requêtes SSE entrantes vers chacun selon le chemin URL.
-//
-//   Claude.ai → https://mcp-hub-adalta.osc-fr1.scalingo.io/boss/sse
-//            → proxy → localhost:3007/sse
+// ── server.js — MCP Hub ADALTA v2 ─────────────────────────────────────────────
+// Gère correctement le protocole MCP/SSE avec suivi des sessions.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const express  = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const { spawn }  = require('child_process');
-const path       = require('path');
+const express = require('express');
+const http    = require('http');
+const { spawn } = require('child_process');
+const path    = require('path');
 
-// ── Déclaration des services ─────────────────────────────────────────────────
 const SERVICES = [
   { name: 'pennylane', repo: 'pennylane-mcp', port: 3001 },
   { name: 'urssaf',    repo: 'urssaf-mcp',    port: 3002 },
@@ -28,119 +23,130 @@ const SERVICES = [
 ];
 
 const SERVICES_DIR = path.join(__dirname, 'services');
+const sessions = new Map(); // sessionId → port
 
-// ── Démarrage des processus enfants ─────────────────────────────────────────
 function startService(svc) {
   const dir = path.join(SERVICES_DIR, svc.repo);
-  console.log(`[HUB] Démarrage de ${svc.name} (port interne ${svc.port})...`);
-
+  console.log(`[HUB] Démarrage ${svc.name} (port ${svc.port})...`);
   const child = spawn('npm', ['start'], {
     cwd: dir,
     env: { ...process.env, PORT: String(svc.port) },
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: process.platform === 'win32',
   });
-
   child.stdout.on('data', d => process.stdout.write(`[${svc.name}] ${d}`));
   child.stderr.on('data', d => process.stderr.write(`[${svc.name}] ${d}`));
-
-  child.on('error', err => {
-    console.error(`[HUB] ✗ Erreur démarrage ${svc.name} : ${err.message}`);
-  });
-
   child.on('exit', (code, signal) => {
-    if (signal === 'SIGTERM') return; // arrêt volontaire
-    console.warn(`[HUB] ⚠ ${svc.name} s'est arrêté (code=${code}). Redémarrage dans 5s...`);
-    setTimeout(() => startService(svc), 5_000);
+    if (signal === 'SIGTERM') return;
+    console.warn(`[HUB] ${svc.name} arrêté. Redémarrage dans 5s...`);
+    setTimeout(() => startService(svc), 5000);
   });
-
-  return child;
 }
 
-// Lancer tous les services
-console.log('[HUB] Lancement des 10 connecteurs MCP...\n');
-for (const svc of SERVICES) {
-  startService(svc);
-}
+for (const svc of SERVICES) startService(svc);
 
-// ── Attente du démarrage des services (10 secondes) ─────────────────────────
 const STARTUP_DELAY = parseInt(process.env.STARTUP_DELAY || '10000', 10);
-console.log(`[HUB] Attente de ${STARTUP_DELAY / 1000}s pour l'initialisation des services...`);
+console.log(`[HUB] Attente ${STARTUP_DELAY / 1000}s...`);
 
 setTimeout(() => {
-
   const app = express();
 
-  // ── Endpoint de santé (/health) ──────────────────────────────
   app.get('/health', (req, res) => {
-    const base = process.env.SCALINGO_APP_URL
-      ? `https://${process.env.SCALINGO_APP_URL}`
-      : `http://localhost:${process.env.PORT || 5000}`;
     res.json({
-      status:    'ok',
+      status: 'ok',
       timestamp: new Date().toISOString(),
+      sessions: sessions.size,
       connecteurs: SERVICES.map(s => ({
         nom: s.name,
-        sse: `${base}/${s.name}/sse`,
+        sse: `https://mcp-hub-adalta.osc-fr1.scalingo.io/${s.name}/sse`,
       })),
     });
   });
 
-  // ── Proxy SSE pour chaque service ────────────────────────────
-  for (const svc of SERVICES) {
-    app.use(
-      `/${svc.name}`,
-      createProxyMiddleware({
-        target:      `http://localhost:${svc.port}`,
-        changeOrigin: false,
-        pathRewrite:  { [`^/${svc.name}`]: '' },
+  // SSE avec tracking de session
+  app.get('/:service/sse', (req, res) => {
+    const svc = SERVICES.find(s => s.name === req.params.service);
+    if (!svc) return res.status(404).json({ error: 'Service inconnu' });
 
-        // Connexions longues / SSE
-        proxyTimeout: 0,
-        timeout:      0,
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
 
-        on: {
-          proxyReq: (proxyReq, req) => {
-            // Headers SSE
-            if (req.headers.accept === 'text/event-stream') {
-              proxyReq.setHeader('Cache-Control', 'no-cache');
-              proxyReq.setHeader('Connection',    'keep-alive');
-            }
-          },
-          proxyRes: (proxyRes) => {
-            // Désactiver le buffering Nginx/Scalingo pour SSE
-            proxyRes.headers['x-accel-buffering'] = 'no';
-            proxyRes.headers['cache-control']     = 'no-cache';
-          },
-          error: (err, req, res) => {
-            console.error(`[HUB] ✗ Proxy ${svc.name} : ${err.message}`);
-            if (!res.headersSent) {
-              res.writeHead(503, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({
-                error:      `Service ${svc.name} temporairement indisponible`,
-                retryAfter: 5,
-              }));
-            }
-          },
-        },
-      })
-    );
-  }
+    const targetReq = http.request({
+      hostname: 'localhost', port: svc.port, path: '/sse', method: 'GET',
+      headers: { 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache' },
+    }, (targetRes) => {
+      targetRes.on('data', (chunk) => {
+        const text = chunk.toString();
+        const match = text.match(/data:\s*\/messages\?sessionId=([^\s\n\r]+)/);
+        if (match) {
+          const sessionId = match[1].trim();
+          sessions.set(sessionId, svc.port);
+          console.log(`[HUB] Session: ${sessionId} → ${svc.name}`);
+        }
+        res.write(text);
+      });
+      targetRes.on('end', () => res.end());
+      targetRes.on('error', () => res.end());
+    });
 
-  // ── Démarrage du serveur hub ─────────────────────────────────
+    targetReq.on('error', (err) => {
+      console.error(`[HUB] Erreur ${svc.name}:`, err.message);
+      res.end();
+    });
+    targetReq.end();
+    req.on('close', () => targetReq.destroy());
+  });
+
+  // POST /messages → routing par sessionId
+  app.post('/messages', (req, res) => {
+    const sessionId = req.query.sessionId;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId manquant' });
+    const port = sessions.get(sessionId);
+    if (!port) return res.status(404).json({ error: `Session inconnue: ${sessionId}` });
+
+    const proxyReq = http.request({
+      hostname: 'localhost', port, method: 'POST',
+      path: `/messages?sessionId=${sessionId}`,
+      headers: { ...req.headers, host: `localhost:${port}` },
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      if (!res.headersSent) res.status(503).json({ error: err.message });
+    });
+    req.pipe(proxyReq);
+  });
+
+  // POST /:service/messages → compatibilité
+  app.post('/:service/messages', (req, res) => {
+    const svc = SERVICES.find(s => s.name === req.params.service);
+    if (!svc) return res.status(404).json({ error: 'Service inconnu' });
+    const sessionId = req.query.sessionId;
+    const proxyReq = http.request({
+      hostname: 'localhost', port: svc.port, method: 'POST',
+      path: `/messages${sessionId ? `?sessionId=${sessionId}` : ''}`,
+      headers: { ...req.headers, host: `localhost:${svc.port}` },
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      if (!res.headersSent) res.status(503).json({ error: err.message });
+    });
+    req.pipe(proxyReq);
+  });
+
   const PORT = parseInt(process.env.PORT || '5000', 10);
-
   app.listen(PORT, '0.0.0.0', () => {
-    console.log('\n' + '═'.repeat(55));
-    console.log('  MCP HUB ADALTA — Scalingo — ACTIF');
-    console.log('═'.repeat(55));
-    console.log(`  Port d'écoute : ${PORT}`);
-    console.log('\n  Connecteurs disponibles :');
-    for (const svc of SERVICES) {
-      console.log(`    ✓ /${svc.name}/sse → localhost:${svc.port}`);
-    }
-    console.log('\n  Vérification : GET /health');
-    console.log('═'.repeat(55) + '\n');
+    console.log('\n' + '═'.repeat(50));
+    console.log('  MCP HUB ADALTA v2 — ACTIF sur port ' + PORT);
+    console.log('═'.repeat(50));
+    SERVICES.forEach(s => console.log(`  ✓ /${s.name}/sse`));
+    console.log('═'.repeat(50) + '\n');
   });
 
 }, STARTUP_DELAY);
